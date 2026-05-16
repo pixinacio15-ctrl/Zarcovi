@@ -1,13 +1,10 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const P = require('pino');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-const client = new Client({
-  authStrategy: new LocalAuth()
-});
-
+const logger = P({ level: 'silent' });
 let ADMIN_ID = process.env.ADMIN_ID || null;
 const dataPath = path.join(__dirname, 'personagens.json');
 
@@ -37,256 +34,243 @@ function salvarPersonagens(dados) {
   fs.writeFileSync(dataPath, JSON.stringify(dados, null, 2));
 }
 
-client.on('ready', () => {
-  console.log('✅ Bot conectado com sucesso!');
-  console.log('\n🔐 CÓDIGO DE PAREAMENTO GERADO:\n');
-  codigoPareavento = gerarCodigoPareavento();
-  console.log(`📱 Código: ${codigoPareavento}`);
-  console.log('\n👉 Envie este código no WhatsApp para pareá-lo com o bot!');
-  console.log('\n================================================\n');
-});
-
-client.on('qr', (qr) => {
-  console.log('📱 Escaneie o QR Code abaixo para conectar o bot:\n');
-  qrcode.generate(qr, { small: true });
-  console.log('\n⏳ Aguardando autenticação...');
-});
-
-client.on('message', async (message) => {
-  const texto = message.body.toLowerCase().trim();
-  const chat = await message.getChat();
+async function conectarBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
   
-  // ============================================
-  // SISTEMA DE PAREAMENTO
-  // ============================================
-  
-  if (!botPareado && texto === codigoPareavento) {
-    botPareado = true;
-    ADMIN_ID = message.from;
-    console.log(`\n✅ Bot pareado com sucesso! ID: ${message.from}`);
-    return message.reply('✅ *Bot pareado com sucesso!*\n\nVocê agora é o ADMIN. Use !ajuda para ver os comandos.');
-  }
+  const sock = makeWASocket({
+    auth: state,
+    logger: logger,
+    printQRInTerminal: true
+  });
 
-  if (!botPareado) {
-    return message.reply('❌ *Bot não pareado!*\n\nAguarde o código de pareamento ser gerado.');
-  }
-
-  const isAdmin = message.from === ADMIN_ID || message.author === ADMIN_ID;
-
-  // Comando !ajuda
-  if (texto === '!ajuda') {
-    let ajuda = `🎮 *Comandos Disponíveis Zarcovi*\n\n`;
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update;
     
-    if (isAdmin) {
-      ajuda += `👑 *COMANDOS ADMIN:*\n`;
-      ajuda += `!cadastrar [nome do personagem] - Cadastra um novo personagem\n`;
-      ajuda += `!adicionar_habilidade [nome] | [legenda] - Adiciona habilidade (responda a uma imagem)\n`;
-      ajuda += `!listar_cadastrados - Lista todos os personagens cadastrados\n`;
-      ajuda += `!deletar_personagem [nome] - Deleta um personagem\n\n`;
+    if (connection === 'connecting') {
+      console.log('📱 Conectando ao WhatsApp...');
+    } else if (connection === 'open') {
+      console.log('✅ Bot conectado com sucesso!');
+      console.log('\n🔐 CÓDIGO DE PAREAMENTO GERADO:\n');
+      codigoPareavento = gerarCodigoPareavento();
+      console.log(`📱 Código: ${codigoPareavento}`);
+      console.log('\n👉 Envie este código no WhatsApp para pareá-lo com o bot!');
+      console.log('\n================================================\n');
+    } else if (connection === 'close') {
+      let shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Desconectado!', shouldReconnect ? 'Reconectando...' : 'Faça login novamente.');
+      if (shouldReconnect) {
+        conectarBot();
+      }
     }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('messages.upsert', async (m) => {
+    const msg = m.messages[0];
+    if (!msg.message) return;
+
+    const texto = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').toLowerCase().trim();
+    const remetente = msg.key.remoteJid.split('@')[0];
     
-    ajuda += `👥 *COMANDOS GERAIS:*\n`;
-    ajuda += `!loja [nome do personagem] - Visualiza as habilidades do personagem\n`;
-    ajuda += `!personagens - Lista todos os personagens disponíveis\n`;
-    ajuda += `!ajuda - Mostra esta mensagem\n`;
+    // ============================================
+    // SISTEMA DE PAREAMENTO
+    // ============================================
     
-    if (isAdmin) {
-      ajuda += `\n🔐 *INFORMAÇÕES:*\n`;
-      ajuda += `ID Admin: ${ADMIN_ID}\n`;
-      ajuda += `Bot Pareado: ✅`;
-    }
-    
-    return message.reply(ajuda);
-  }
-
-  // Comando !cadastrar [nome] - Apenas Admin
-  if (texto.startsWith('!cadastrar ')) {
-    if (!isAdmin) {
-      return message.reply('❌ Apenas admins podem cadastrar personagens!');
+    if (!botPareado && texto === codigoPareavento) {
+      botPareado = true;
+      ADMIN_ID = msg.key.remoteJid;
+      console.log(`\n✅ Bot pareado com sucesso! ID: ${msg.key.remoteJid}`);
+      await sock.sendMessage(msg.key.remoteJid, { text: '✅ *Bot pareado com sucesso!*\n\nVocê agora é o ADMIN. Use !ajuda para ver os comandos.' });
+      return;
     }
 
-    const nomePersonagem = texto.replace('!cadastrar ', '').trim();
-
-    if (!nomePersonagem) {
-      return message.reply('❌ Use: !cadastrar [nome do personagem]');
+    if (!botPareado) {
+      await sock.sendMessage(msg.key.remoteJid, { text: '❌ *Bot não pareado!*\n\nAguarde o código de pareamento ser gerado.' });
+      return;
     }
 
-    if (personagens[nomePersonagem]) {
-      return message.reply(`⚠️ O personagem "${nomePersonagem}" já existe!`);
+    const isAdmin = msg.key.remoteJid === ADMIN_ID;
+
+    // Comando !ajuda
+    if (texto === '!ajuda') {
+      let ajuda = `🎮 *Comandos Disponíveis Zarcovi*\n\n`;
+      
+      if (isAdmin) {
+        ajuda += `👑 *COMANDOS ADMIN:*\n`;
+        ajuda += `!cadastrar [nome do personagem] - Cadastra um novo personagem\n`;
+        ajuda += `!adicionar_habilidade [nome] | [legenda] - Adiciona habilidade (responda a uma imagem)\n`;
+        ajuda += `!listar_cadastrados - Lista todos os personagens cadastrados\n`;
+        ajuda += `!deletar_personagem [nome] - Deleta um personagem\n\n`;
+      }
+      
+      ajuda += `👥 *COMANDOS GERAIS:*\n`;
+      ajuda += `!loja [nome do personagem] - Visualiza as habilidades do personagem\n`;
+      ajuda += `!personagens - Lista todos os personagens disponíveis\n`;
+      ajuda += `!ajuda - Mostra esta mensagem\n`;
+      
+      if (isAdmin) {
+        ajuda += `\n🔐 *INFORMAÇÕES:*\n`;
+        ajuda += `ID Admin: ${ADMIN_ID}\n`;
+        ajuda += `Bot Pareado: ✅`;
+      }
+      
+      await sock.sendMessage(msg.key.remoteJid, { text: ajuda });
+      return;
     }
 
-    // Cria estrutura do personagem
-    personagens[nomePersonagem] = {
-      nome: nomePersonagem,
-      habilidades: [],
-      criado_em: new Date().toISOString(),
-      criado_por: message.from
-    };
-
-    salvarPersonagens(personagens);
-    return message.reply(`✅ Personagem "${nomePersonagem}" cadastrado com sucesso!\n\nAgora envie as imagens com legendas e use !adicionar_habilidade [nome da habilidade] | [legenda]`);
-  }
-
-  // Comando !adicionar_habilidade [nome] - Apenas Admin
-  if (texto.startsWith('!adicionar_habilidade ')) {
-    if (!isAdmin) {
-      return message.reply('❌ Apenas admins podem adicionar habilidades!');
-    }
-
-    // Verifica se é uma resposta a mensagem anterior
-    const quotedMsg = await message.getQuotedMessage();
-    if (!quotedMsg || !quotedMsg.hasMedia) {
-      return message.reply('❌ Responda a uma mensagem com imagem e use:\n!adicionar_habilidade [nome da habilidade] | [legenda]');
-    }
-
-    const args = texto.replace('!adicionar_habilidade ', '').trim().split('|');
-    const nomeHabilidade = args[0].trim();
-    const legenda = args[1]?.trim() || '';
-
-    if (!nomeHabilidade) {
-      return message.reply('❌ Use: !adicionar_habilidade [nome] | [legenda]');
-    }
-
-    // Encontra o personagem (último mencionado)
-    const personagemAtual = Object.keys(personagens)[Object.keys(personagens).length - 1];
-
-    if (!personagemAtual) {
-      return message.reply('❌ Nenhum personagem cadastrado!');
-    }
-
-    try {
-      const media = await quotedMsg.downloadMedia();
-      const nomeArquivo = `habilidade_${Date.now()}.${media.mimType.split('/')[1]}`;
-      const caminhoArquivo = path.join(__dirname, 'media', nomeArquivo);
-
-      // Cria pasta media se não existir
-      if (!fs.existsSync(path.join(__dirname, 'media'))) {
-        fs.mkdirSync(path.join(__dirname, 'media'), { recursive: true });
+    // Comando !cadastrar [nome] - Apenas Admin
+    if (texto.startsWith('!cadastrar ')) {
+      if (!isAdmin) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Apenas admins podem cadastrar personagens!' });
+        return;
       }
 
-      fs.writeFileSync(caminhoArquivo, Buffer.from(media.data, 'base64'));
+      const nomePersonagem = texto.replace('!cadastrar ', '').trim();
 
-      personagens[personagemAtual].habilidades.push({
-        nome: nomeHabilidade,
-        legenda: legenda,
-        imagem: nomeArquivo,
-        adicionado_em: new Date().toISOString()
-      });
+      if (!nomePersonagem) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Use: !cadastrar [nome do personagem]' });
+        return;
+      }
+
+      if (personagens[nomePersonagem]) {
+        await sock.sendMessage(msg.key.remoteJid, { text: `⚠️ O personagem "${nomePersonagem}" já existe!` });
+        return;
+      }
+
+      personagens[nomePersonagem] = {
+        nome: nomePersonagem,
+        habilidades: [],
+        criado_em: new Date().toISOString(),
+        criado_por: msg.key.remoteJid
+      };
 
       salvarPersonagens(personagens);
-      return message.reply(`✅ Habilidade "${nomeHabilidade}" adicionada a "${personagemAtual}"!`);
-    } catch (err) {
-      console.error('Erro ao processar imagem:', err);
-      return message.reply('❌ Erro ao processar a imagem!');
-    }
-  }
-
-  // Comando !loja [nome do personagem] - Usuários comuns
-  if (texto.startsWith('!loja ')) {
-    const nomePersonagem = texto.replace('!loja ', '').trim();
-
-    if (!nomePersonagem) {
-      return message.reply('❌ Use: !loja [nome do personagem]');
+      await sock.sendMessage(msg.key.remoteJid, { text: `✅ Personagem "${nomePersonagem}" cadastrado com sucesso!\n\nAgora envie as imagens com legendas e use !adicionar_habilidade [nome da habilidade] | [legenda]` });
+      return;
     }
 
-    const personagem = personagens[nomePersonagem];
+    // Comando !listar_cadastrados - Apenas Admin
+    if (texto === '!listar_cadastrados') {
+      if (!isAdmin) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Apenas admins podem listar personagens!' });
+        return;
+      }
 
-    if (!personagem) {
-      return message.reply(`❌ Personagem "${nomePersonagem}" não encontrado!`);
+      const lista = Object.keys(personagens);
+
+      if (lista.length === 0) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '📋 Nenhum personagem cadastrado ainda.' });
+        return;
+      }
+
+      let resposta = `📋 *Personagens Cadastrados:*\n\n`;
+      for (const nome of lista) {
+        resposta += `🎭 ${nome} - ${personagens[nome].habilidades.length} habilidades\n`;
+      }
+
+      await sock.sendMessage(msg.key.remoteJid, { text: resposta });
+      return;
     }
 
-    if (personagem.habilidades.length === 0) {
-      return message.reply(`📋 ${nomePersonagem} não possui habilidades cadastradas ainda.`);
+    // Comando !personagens - Para todos
+    if (texto === '!personagens') {
+      const lista = Object.keys(personagens);
+
+      if (lista.length === 0) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '📋 Nenhum personagem cadastrado ainda.' });
+        return;
+      }
+
+      let resposta = `🎭 *Personagens Disponíveis:*\n\n`;
+      for (const nome of lista) {
+        resposta += `⭐ ${nome}\n`;
+      }
+      resposta += `\n💡 Use !loja [nome] para ver as habilidades`;
+
+      await sock.sendMessage(msg.key.remoteJid, { text: resposta });
+      return;
     }
 
-    // Envia cada habilidade com imagem + legenda
-    for (const habilidade of personagem.habilidades) {
-      const caminhoImagem = path.join(__dirname, 'media', habilidade.imagem);
+    // Comando !loja [nome do personagem] - Usuários comuns
+    if (texto.startsWith('!loja ')) {
+      const nomePersonagem = texto.replace('!loja ', '').trim();
 
-      if (fs.existsSync(caminhoImagem)) {
-        try {
-          // Envia a imagem com caption
-          const { MessageMedia } = require('whatsapp-web.js');
-          const media = MessageMedia.fromFilePath(caminhoImagem);
-          await chat.sendMessage(media, {
-            caption: `🔥 *${habilidade.nome}*\n${habilidade.legenda}`
-          });
-        } catch (err) {
-          console.error('Erro ao enviar habilidade:', err);
+      if (!nomePersonagem) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Use: !loja [nome do personagem]' });
+        return;
+      }
+
+      const personagem = personagens[nomePersonagem];
+
+      if (!personagem) {
+        await sock.sendMessage(msg.key.remoteJid, { text: `❌ Personagem "${nomePersonagem}" não encontrado!` });
+        return;
+      }
+
+      if (personagem.habilidades.length === 0) {
+        await sock.sendMessage(msg.key.remoteJid, { text: `📋 ${nomePersonagem} não possui habilidades cadastradas ainda.` });
+        return;
+      }
+
+      await sock.sendMessage(msg.key.remoteJid, { text: `✅ Habilidades de ${nomePersonagem} enviadas com sucesso!` });
+
+      for (const habilidade of personagem.habilidades) {
+        const caminhoImagem = path.join(__dirname, 'media', habilidade.imagem);
+
+        if (fs.existsSync(caminhoImagem)) {
+          try {
+            await sock.sendMessage(msg.key.remoteJid, {
+              image: fs.readFileSync(caminhoImagem),
+              caption: `🔥 *${habilidade.nome}*\n${habilidade.legenda}`
+            });
+          } catch (err) {
+            console.error('Erro ao enviar habilidade:', err);
+          }
         }
       }
+      return;
     }
 
-    message.reply(`✅ Habilidades de ${nomePersonagem} enviadas com sucesso!`);
-  }
-
-  // Comando !listar_cadastrados - Apenas Admin
-  if (texto === '!listar_cadastrados') {
-    if (!isAdmin) {
-      return message.reply('❌ Apenas admins podem listar personagens!');
-    }
-
-    const lista = Object.keys(personagens);
-
-    if (lista.length === 0) {
-      return message.reply('📋 Nenhum personagem cadastrado ainda.');
-    }
-
-    let resposta = `📋 *Personagens Cadastrados:*\n\n`;
-    for (const nome of lista) {
-      resposta += `🎭 ${nome} - ${personagens[nome].habilidades.length} habilidades\n`;
-    }
-
-    message.reply(resposta);
-  }
-
-  // Comando !personagens - Para todos
-  if (texto === '!personagens') {
-    const lista = Object.keys(personagens);
-
-    if (lista.length === 0) {
-      return message.reply('📋 Nenhum personagem cadastrado ainda.');
-    }
-
-    let resposta = `🎭 *Personagens Disponíveis:*\n\n`;
-    for (const nome of lista) {
-      resposta += `⭐ ${nome}\n`;
-    }
-    resposta += `\n💡 Use !loja [nome] para ver as habilidades`;
-
-    message.reply(resposta);
-  }
-
-  // Comando !deletar_personagem [nome] - Apenas Admin
-  if (texto.startsWith('!deletar_personagem ')) {
-    if (!isAdmin) {
-      return message.reply('❌ Apenas admins podem deletar personagens!');
-    }
-
-    const nomePersonagem = texto.replace('!deletar_personagem ', '').trim();
-
-    if (!nomePersonagem) {
-      return message.reply('❌ Use: !deletar_personagem [nome do personagem]');
-    }
-
-    if (!personagens[nomePersonagem]) {
-      return message.reply(`❌ Personagem "${nomePersonagem}" não encontrado!`);
-    }
-
-    // Deleta as imagens associadas
-    const habilidades = personagens[nomePersonagem].habilidades;
-    for (const hab of habilidades) {
-      const caminhoImagem = path.join(__dirname, 'media', hab.imagem);
-      if (fs.existsSync(caminhoImagem)) {
-        fs.unlinkSync(caminhoImagem);
+    // Comando !deletar_personagem [nome] - Apenas Admin
+    if (texto.startsWith('!deletar_personagem ')) {
+      if (!isAdmin) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Apenas admins podem deletar personagens!' });
+        return;
       }
+
+      const nomePersonagem = texto.replace('!deletar_personagem ', '').trim();
+
+      if (!nomePersonagem) {
+        await sock.sendMessage(msg.key.remoteJid, { text: '❌ Use: !deletar_personagem [nome do personagem]' });
+        return;
+      }
+
+      if (!personagens[nomePersonagem]) {
+        await sock.sendMessage(msg.key.remoteJid, { text: `❌ Personagem "${nomePersonagem}" não encontrado!` });
+        return;
+      }
+
+      const habilidades = personagens[nomePersonagem].habilidades;
+      for (const hab of habilidades) {
+        const caminhoImagem = path.join(__dirname, 'media', hab.imagem);
+        if (fs.existsSync(caminhoImagem)) {
+          fs.unlinkSync(caminhoImagem);
+        }
+      }
+
+      delete personagens[nomePersonagem];
+      salvarPersonagens(personagens);
+
+      await sock.sendMessage(msg.key.remoteJid, { text: `✅ Personagem "${nomePersonagem}" deletado com sucesso!` });
+      return;
     }
+  });
 
-    delete personagens[nomePersonagem];
-    salvarPersonagens(personagens);
+  return sock;
+}
 
-    return message.reply(`✅ Personagem "${nomePersonagem}" deletado com sucesso!`);
-  }
+conectarBot().catch(err => {
+  console.error('Erro ao conectar:', err);
+  process.exit(1);
 });
-
-client.initialize();
